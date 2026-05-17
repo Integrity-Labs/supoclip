@@ -177,5 +177,10 @@ class WorkerSettings:
     job_timeout = 10800  # 3 hour timeout for video processing
 
     # Worker pool settings
-    max_jobs = 4  # Process up to 4 jobs simultaneously
+    # Run a single job at a time so the full task CPU budget goes to one
+    # ffmpeg encode (libx264 doesn't scale linearly past ~4-6 threads and
+    # concurrent merges starve each other). Concurrency above 1 should
+    # come from scaling the ECS service horizontally, not packing jobs
+    # onto a single worker.
+    max_jobs = 1
     cron_jobs = []
