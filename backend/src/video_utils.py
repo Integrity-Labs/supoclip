@@ -34,11 +34,15 @@ from .font_registry import FONTS_DIR, find_font_path, get_font_family_name
 
 logger = logging.getLogger(__name__)
 TRANSCRIPT_CACHE_SCHEMA_VERSION = 2
+# `vertical` performs diarization-driven hard-cut speaker reframing, falling back to a
+# static centre crop for single-speaker clips. `horizontal` is the BN-template-aligned
+# name for keep-source 16:9 output; `original` is retained as a backward-compatible alias.
+HORIZONTAL_OUTPUT_FORMATS = {"horizontal", "original"}
 VALID_OUTPUT_FORMATS = {
     "vertical",
     "vertical_pan",
     "vertical_split",
-    "vertical_cut",
+    "horizontal",
     "original",
 }
 CLIP_END_SENTENCE_EXTENSION_SECONDS = 3.0
@@ -1465,14 +1469,32 @@ def detect_speaker_reframe_plan(
     output_format: str,
     utterances: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a speaker-aware pan, hard-cut, or split-screen plan for a trimmed clip.
+    """Build a speaker-aware hard-cut, pan, or split-screen plan for a trimmed clip.
 
-    ``vertical_cut`` uses the diarized ``utterances`` (clip-relative seconds, with a
-    ``speaker`` label) to decide *when* to cut, and the per-region lip-motion signal to
-    decide *where* each speaker sits. Cuts reuse the same step-function crop expression
-    as ``vertical_pan`` — for a hard cut the step is the intended behaviour, not a bug.
+    The default ``vertical`` path uses the diarized ``utterances`` (clip-relative
+    seconds, with a ``speaker`` label) to decide *when* to cut and the per-region
+    lip-motion signal to decide *where* each speaker sits. Cuts reuse the same
+    step-function crop expression as ``vertical_pan`` — for a hard cut the step is the
+    intended behaviour, not a bug. Returning ``None`` lets the caller fall back to the
+    static centre crop (single-speaker clips, no diarization, etc.).
     """
     try:
+        # Cheap early-out for the default 'vertical' hard-cut path: a clip with fewer
+        # than two diarized speakers needs no cuts, so skip face detection and the
+        # motion pass entirely and let the caller render the static crop.
+        if output_format == "vertical":
+            distinct_speakers = {
+                utterance.get("speaker")
+                for utterance in (utterances or [])
+                if utterance.get("speaker")
+            }
+            if len(distinct_speakers) < 2:
+                logger.info(
+                    "vertical: %d diarized speaker(s) — using static crop",
+                    len(distinct_speakers),
+                )
+                return None
+
         width, height = ffprobe_video_size(clip_path)
         if width / max(height, 1) <= 1.2:
             return None
@@ -1507,10 +1529,6 @@ def detect_speaker_reframe_plan(
                 "height": height,
                 "regions": regions,
             }
-
-        if output_format == "vertical_cut" and not utterances:
-            logger.info("Skipping vertical_cut: no diarized utterances for this clip")
-            return None
 
         with tempfile.TemporaryDirectory(prefix="supoclip_motion_") as motion_dir:
             left_motion = Path(motion_dir) / "left.txt"
@@ -1552,18 +1570,16 @@ def detect_speaker_reframe_plan(
             times, left_values = parse_motion_metadata(left_motion)
             _, right_values = parse_motion_metadata(right_motion)
 
-        if output_format == "vertical_cut":
+        if output_format == "vertical":
             label_to_side = map_speaker_labels_to_sides(
                 utterances, times, left_values, right_values
             )
             if len(set(label_to_side.values())) < 2:
-                logger.info(
-                    "Skipping vertical_cut: only one speaker zone in use (static crop)"
-                )
+                logger.info("vertical: only one speaker zone in use — static crop")
                 return None
             timeline = build_speaker_timeline_from_utterances(utterances, label_to_side)
             if len(timeline) < 2:
-                logger.info("Skipping vertical_cut: fewer than 2 speaker turns")
+                logger.info("vertical: fewer than 2 speaker turns — static crop")
                 return None
             return {
                 "mode": "cut",
@@ -1616,13 +1632,13 @@ def render_reframed_clip_ffmpeg(
 ) -> Tuple[bool, int, int]:
     """Render the requested aspect/framing mode and return final dimensions."""
     width, height = ffprobe_video_size(input_path)
-    if output_format == "original":
+    if output_format in HORIZONTAL_OUTPUT_FORMATS:
         shutil.copyfile(input_path, output_path)
         return True, round_to_even(width), round_to_even(height)
 
     plan = (
         detect_speaker_reframe_plan(input_path, output_format, utterances)
-        if output_format in {"vertical_pan", "vertical_split", "vertical_cut"}
+        if output_format in {"vertical", "vertical_pan", "vertical_split"}
         else None
     )
     if plan and plan["mode"] in {"pan", "cut"}:
@@ -2248,7 +2264,8 @@ def create_optimized_clip(
     output_format: str = "vertical",
     keep_ranges: Optional[List[Tuple[float, float]]] = None,
 ) -> bool:
-    """Create clip with optional subtitles. output_format: 'vertical' (9:16) or 'original' (keep source size)."""
+    """Create clip with optional subtitles. output_format: 'vertical' (9:16, hard-cut
+    speaker reframing) or 'horizontal' (keep source 16:9; 'original' is an alias)."""
     try:
         if keep_ranges:
             effective_keep_ranges = normalize_source_ranges(keep_ranges)
@@ -2267,13 +2284,14 @@ def create_optimized_clip(
             logger.error(f"Invalid clip duration: {duration:.1f}s")
             return False
 
-        keep_original = output_format == "original"
+        keep_original = output_format in HORIZONTAL_OUTPUT_FORMATS
         logger.info(
             f"Creating clip: {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s) "
-            f"subtitles={add_subtitles} template '{caption_template}' format={'original' if keep_original else 'vertical'}"
+            f"subtitles={add_subtitles} template '{caption_template}' "
+            f"format={'horizontal' if keep_original else output_format}"
         )
 
-        # Fast path: no subtitles + original = ffmpeg stream copy (no re-encoding)
+        # Fast path: no subtitles + horizontal = ffmpeg stream copy (no re-encoding)
         if not add_subtitles and keep_original and len(effective_keep_ranges) == 1:
             fast_path_start, fast_path_end = effective_keep_ranges[0]
             result = subprocess.run(
@@ -2316,7 +2334,7 @@ def create_optimized_clip(
             )
             clip_utterances = (
                 load_clip_relative_utterances(video_path, effective_keep_ranges)
-                if reframe_format == "vertical_cut"
+                if reframe_format == "vertical"
                 else None
             )
             framed_ok, target_width, target_height = render_reframed_clip_ffmpeg(

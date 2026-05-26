@@ -18,16 +18,24 @@ gets the clip path today).
 **Consequence:** `build_pan_expression`'s nested `if(lt(t,...))` **step function** is the *correct*
 primitive for cuts (it was only a bug for *panning*). Reuse it, fed by diarization-derived segments.
 
-### Revised Slice 1 (torch-free, gated behind a new `vertical_cut` output_format)
+### Implementation (torch-free) — `vertical` IS hard-cut reframing
 1. Thread existing AssemblyAI utterances into the reframe stage.
 2. Build a whole-clip cut timeline: merge consecutive same-speaker utterances, enforce a **minimum
    segment duration** (debounce rapid back-and-forth), hold a wider shot on crosstalk/short interjections.
-3. Map each diarized speaker label → face zone (sample frames within that speaker's utterances, bind
-   to the lip-active face cluster). Generalise beyond the current 2-face limit.
+3. Map each diarized speaker label → face zone (per-region lip-motion aggregated over that speaker's
+   utterances). Generalise beyond the current 2-face limit.
 4. Render hard cuts via the existing step expression (no smoothing/SavGol/torch). Even-dim clamp,
-   keyframe cap, center-crop fallback.
-5. Gate behind a new `output_format` (do **not** flip the default; shadow/canary first). New format
-   must also be wired through the BN SUPOCLIP plugin / `Tools.ts` + `sync-tools`.
+   center-crop fallback.
+
+**Format naming (decided with product):**
+- `vertical` (the default) now performs hard-cut speaker reframing, with a **cheap single-speaker
+  early-out → static centre crop** (so single-speaker clips render exactly as before and pay no extra
+  cost; only multi-speaker clips change). The earlier separate `vertical_cut` format was folded into
+  `vertical`.
+- `horizontal` renames the old `original` (keep-source 16:9) to match BN template terminology;
+  `original` is kept as a backward-compatible alias.
+- Follow-up: map the BN-selected template orientation (`horizontal.video` / `vertical.video`) →
+  `output_format` in the `SUPOCLIP_CLIP_VIDEO` skill (+ `sync-skills`).
 
 **Dropped vs original plan:** smooth pan, Savitzky-Golay smoothing, vendoring LR-ASD + torch.
 

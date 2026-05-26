@@ -266,6 +266,21 @@ class VideoUtilsHardCutReframeTests(unittest.TestCase):
         self.assertEqual(len(timeline), 1)
         self.assertEqual(timeline[0]["speaker"], "left")
 
+    def test_single_speaker_maps_to_one_side_triggers_static_fallback(self):
+        # One diarized speaker -> only one side in the mapping. detect_speaker_reframe_plan
+        # treats len(set(sides)) < 2 as "no cuts" and falls back to the static crop.
+        times = [0.0, 1.0, 2.0, 3.0]
+        left_values = [5.0, 5.0, 5.0, 5.0]
+        right_values = [1.0, 1.0, 1.0, 1.0]
+        utterances = [{"start": 0.0, "end": 3.5, "speaker": "A"}]
+
+        mapping = video_utils.map_speaker_labels_to_sides(
+            utterances, times, left_values, right_values
+        )
+
+        self.assertEqual(set(mapping.values()), {"left"})
+        self.assertLess(len(set(mapping.values())), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
