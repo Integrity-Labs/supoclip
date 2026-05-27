@@ -408,3 +408,28 @@ class TestResolveBorderStyle:
 
     def test_stroke_color_on_non_box_template_stays_outline(self):
         assert video_utils.resolve_border_style({"background": False, "background_color": None}, "#000000") == 1
+
+
+class TestCaptionWrapping:
+    """ENG-5634: wide caption chunks wrap across lines (\\N) instead of running
+    off the frame (WrapStyle 2 + \\pos does no auto-wrap)."""
+
+    def test_no_break_when_text_fits(self):
+        # Small font, short text → fits one line, no breaks.
+        assert video_utils.caption_line_break_indices(["hello", "world"], 40, 952) == set()
+
+    def test_wide_text_wraps_at_large_font(self):
+        words = ["puppies.", "Just", "to", "keep", "you", "like"]
+        breaks = video_utils.caption_line_break_indices(words, 150, 952)
+        assert breaks  # large font on a 1080-wide frame must wrap
+
+    def test_break_index_is_after_a_word(self):
+        words = ["puppies.", "Just", "to", "keep", "you", "like"]
+        breaks = video_utils.caption_line_break_indices(words, 150, 952)
+        assert all(0 <= b < len(words) - 1 for b in breaks)
+
+    def test_join_inserts_newline_at_breaks(self):
+        assert video_utils.join_caption_parts(["a", "b", "c"], {0}) == "a\\Nb c"
+
+    def test_join_all_spaces_without_breaks(self):
+        assert video_utils.join_caption_parts(["a", "b", "c"], set()) == "a b c"
