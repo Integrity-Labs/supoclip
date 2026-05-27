@@ -1103,6 +1103,23 @@ def resolve_outline_px(template: Dict[str, Any], stroke_color: Optional[str]) ->
     return px
 
 
+def resolve_border_style(template: Dict[str, Any], stroke_color: Optional[str]) -> int:
+    """ASS BorderStyle for captions: 1 = per-glyph outline, 3 = opaque box
+    behind the text.
+
+    An explicit ``stroke_color`` means the user wants a text OUTLINE, so force
+    BorderStyle 1 even when the template renders an opaque box (e.g. "minimal"
+    sets ``background`` + ``background_color``). Without this, the chosen outline
+    colour renders as a box border around a filled background rather than an
+    actual outline. With no stroke override, honour the template's box. (ENG-5634.)
+    """
+    if stroke_color:
+        return 1
+    if template.get("background") and template.get("background_color"):
+        return 3
+    return 1
+
+
 def build_assemblyai_ass_subtitles(
     video_path: Path,
     clip_start: float,
@@ -1157,7 +1174,7 @@ def build_assemblyai_ass_subtitles(
     pos_y = float(template.get("position_y", 0.75))
     y_pos = int(video_height * pos_y)
     font_name = ass_font_name(effective_font_family)
-    border_style = 3 if template.get("background") and template.get("background_color") else 1
+    border_style = resolve_border_style(template, stroke_color)
 
     header = f"""[Script Info]
 ScriptType: v4.00+

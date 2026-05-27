@@ -387,3 +387,24 @@ class TestGetScaledFontSize:
     def test_template_default_size_unaffected(self):
         # Minimal's 24 on a 1080 clip → 36, comfortably under the cap.
         assert video_utils.get_scaled_font_size(24, 1080) == 36
+
+
+class TestResolveBorderStyle:
+    """ENG-5634: an explicit stroke colour must render a per-glyph outline
+    (BorderStyle 1), not the template's opaque box (BorderStyle 3)."""
+
+    BOX_TEMPLATE = {"background": True, "background_color": "#00000080"}
+
+    def test_stroke_color_forces_outline_over_box(self):
+        # The reported bug: "minimal" (a box template) + an outline colour
+        # rendered a black box, not an outline.
+        assert video_utils.resolve_border_style(self.BOX_TEMPLATE, "#000000") == 1
+
+    def test_box_template_keeps_box_without_stroke(self):
+        assert video_utils.resolve_border_style(self.BOX_TEMPLATE, None) == 3
+
+    def test_non_box_template_is_outline(self):
+        assert video_utils.resolve_border_style({"background": False, "background_color": None}, None) == 1
+
+    def test_stroke_color_on_non_box_template_stays_outline(self):
+        assert video_utils.resolve_border_style({"background": False, "background_color": None}, "#000000") == 1
