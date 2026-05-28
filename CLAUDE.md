@@ -2,9 +2,33 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ Two remotes — do NOT push or PR against `origin`
+
+This checkout is the **Integrity-Labs fork** of SupoClip, but the `origin` remote points at the **upstream** (`FujiwaraChoki/supoclip`). Our fork is `integrity`.
+
+```bash
+$ git remote -v
+integrity   https://github.com/Integrity-Labs/supoclip.git   (fetch/push)   ← USE THIS
+origin      https://github.com/FujiwaraChoki/supoclip.git    (fetch/push)   ← upstream, do NOT push here
+```
+
+Consequences if you forget:
+
+- `git push -u integrity HEAD` — correct
+- `git push` with no remote on a new branch — may publish to `origin` (the upstream fork)
+- `gh pr create` with no `--repo` — defaults to whichever remote `gh` picks first; in this checkout that's `origin`, so the PR opens against `FujiwaraChoki/supoclip` rather than our fork. Caught the hard way on ENG-5686; the wrong-repo PR was closed within ~30s but it's still a footgun.
+
+**Always:**
+
+- Push with `git push -u integrity HEAD`
+- Open PRs with `gh pr create --repo Integrity-Labs/supoclip --base main --head Integrity-Labs:<branch-name>`
+- Sanity-check the URL in `gh`'s output before sharing it.
+
+If you need to sync from upstream, fetch `origin` explicitly and rebase/merge locally — don't push upstream-tracking branches.
+
 ## Project Overview
 
-SupoClip is an open-source alternative to OpusClip — an AI-powered video clipping tool that transforms long-form content into viral short clips. AGPL-3.0 licensed.
+SupoClip is an open-source alternative to OpusClip — an AI-powered video clipping tool that transforms long-form content into viral short clips. AGPL-3.0 licensed. This Integrity-Labs fork is the production deployment used by BrandNinja (see `brandninja-monorepo` integration via `SUPOCLIP` plugin and `transcript_url` handoff from ENG-5675/5686).
 
 ## Development Commands
 
