@@ -11,6 +11,7 @@ from pathlib import Path
 import json
 import hashlib
 from time import perf_counter
+from urllib.parse import urlparse
 
 import redis.asyncio as redis
 
@@ -62,11 +63,44 @@ class TaskService:
         self.config = config or get_config()
 
     @staticmethod
-    def _build_cache_key(url: str, source_type: str, processing_mode: str) -> str:
+    def _build_cache_key(
+        url: str,
+        source_type: str,
+        processing_mode: str,
+        transcript_url: Optional[str] = None,
+    ) -> str:
+        # Include a stable signal from transcript_url in the key so an
+        # AssemblyAI-derived cache entry isn't reused when a later task for
+        # the same source supplies a BN transcript (or vice versa). The
+        # transcript content differs between providers (word boundaries,
+        # speaker labels, punctuation), so reusing the cached analysis_json
+        # built from one provider can produce subtly different clip selection
+        # when the other provider's text is in play.
+        #
+        # Use the URL's path (no querystring) rather than the full signed URL:
+        # BN's signed URLs rotate per task-create but the underlying S3 key
+        # is stable for the same SourceRef, so this preserves cache hits
+        # across signature rotations while still distinguishing different
+        # transcripts. Falls back to a sentinel when no transcript_url is set
+        # so cache entries pre-dating ENG-5686 still hash the same way
+        # (no transcript_url = same hash as before the param was added).
+        # (ENG-5686 / CR #32 review.)
         payload = (
             f"{source_type}|{processing_mode}|"
             f"{TRANSCRIPT_ANALYSIS_CACHE_VERSION}|{url.strip()}"
         )
+        # Only append the transcript signal when one is set. Keeping the
+        # no-URL payload byte-identical to the pre-ENG-5686 shape preserves
+        # cache hits on existing entries — a deploy that invalidates every
+        # cached transcript would force a re-transcribe storm on the first
+        # task per source. (ENG-5686 / CR #32 review.)
+        if transcript_url:
+            try:
+                parsed = urlparse(transcript_url)
+                transcript_signal = f"bn:{parsed.netloc}{parsed.path}"
+            except Exception:
+                transcript_signal = "bn:invalid"
+            payload = f"{payload}|{transcript_signal}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _is_stale_queued_task(self, task: Dict[str, Any]) -> bool:
@@ -166,6 +200,7 @@ class TaskService:
         stroke_color: Optional[str] = None,
         max_clips: Optional[int] = None,
         subtitle_position_y: Optional[float] = None,
+        transcript_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process a task: download video, analyze, create clips.
@@ -175,7 +210,9 @@ class TaskService:
             logger.info(f"Starting processing for task {task_id}")
             started_at = datetime.utcnow()
             stage_timings: Dict[str, float] = {}
-            cache_key = self._build_cache_key(url, source_type, processing_mode)
+            cache_key = self._build_cache_key(
+                url, source_type, processing_mode, transcript_url
+            )
 
             cache_entry = await self.cache_repo.get_cache(self.db, cache_key)
             cached_transcript = (
@@ -289,6 +326,7 @@ class TaskService:
                 progress_callback=update_progress,
                 should_cancel=should_cancel,
                 max_clips=max_clips,
+                transcript_url=transcript_url,
             )
             stage_timings["pipeline_seconds"] = round(
                 perf_counter() - pipeline_start, 3
