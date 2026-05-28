@@ -172,6 +172,7 @@ def _merge_task_source_metadata(
     output_format: Any = None,
     add_subtitles: Any = None,
     cleanup_settings: Dict[str, Any] | None = None,
+    transcript_url: Any = None,
 ) -> Dict[str, Any]:
     merged = dict(existing or {})
 
@@ -185,6 +186,13 @@ def _merge_task_source_metadata(
         merged["add_subtitles"] = add_subtitles
     if cleanup_settings:
         merged.update(cleanup_settings)
+    # Persist transcript_url so /tasks/{id}/resume can re-supply it to the
+    # worker (without this, a resumed task silently falls back to AssemblyAI).
+    # The kwarg-replay path covered by arq retries is unaffected — this is
+    # specifically for the manual /resume endpoint which rebuilds the enqueue
+    # call from scratch. (ENG-5686 follow-up to CR #32 review.)
+    if isinstance(transcript_url, str) and transcript_url:
+        merged["transcript_url"] = transcript_url
 
     return merged
 
@@ -357,6 +365,7 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
                 output_format=output_format,
                 add_subtitles=add_subtitles,
                 cleanup_settings=cleanup_settings,
+                transcript_url=transcript_url,
             ),
         )
 
@@ -1181,6 +1190,11 @@ async def resume_task(
             metadata.get("remove_filler_words"),
             metadata.get("filtered_words"),
         )
+        # Re-supply the BN transcript URL on resume so we don't silently fall
+        # back to AssemblyAI for a task that originally consumed the BN
+        # transcript. Value may be a stale signed URL (BN's are ~7-day); the
+        # hydrate helper handles fetch failure gracefully. (ENG-5686 / CR #32)
+        resume_transcript_url = metadata.get("transcript_url")
 
         if not source_url or not source_type:
             raise HTTPException(status_code=400, detail="Task source URL is missing")
@@ -1209,6 +1223,11 @@ async def resume_task(
             task.get("processing_mode") or runtime_config.default_processing_mode
         )
 
+        # Resume re-enqueues with a smaller positional set than the original
+        # create flow (highlight_color, stroke_color, max_clips,
+        # subtitle_position_y are intentionally not restored — a pre-existing
+        # limitation, untouched here). transcript_url is appended as a kwarg
+        # so it survives without disturbing the positional layout. (ENG-5686)
         job_id = await JobQueue.enqueue_processing_job(
             "process_video_task",
             processing_mode,
@@ -1224,6 +1243,7 @@ async def resume_task(
             output_format,
             add_subtitles,
             cleanup_settings,
+            transcript_url=resume_transcript_url,
         )
 
         return {"message": "Task resumed", "job_id": job_id}

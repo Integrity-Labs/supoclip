@@ -191,11 +191,16 @@ class TestHydrateWordCacheFromBnTranscript:
         assert cached["words"][0]["start"] == 0
         assert cached["words"][0]["end"] == 400
 
-    def test_skips_when_cache_already_exists(self, tmp_path):
+    def test_skips_when_bn_hydrated_cache_already_exists(self, tmp_path):
+        """An existing cache carrying the bn_source marker is reused (no
+        re-fetch). Covers the arq retry case where /tmp survived the SIGTERM
+        and the prior BN hydrate is still on disk."""
         video_path = tmp_path / "video.mp4"
         video_path.write_bytes(b"")
         cache_path = tmp_path / "video.transcript_cache.json"
-        cache_path.write_text('{"version": 2, "words": [], "utterances": [], "text": ""}')
+        cache_path.write_text(
+            '{"version": 2, "words": [], "utterances": [], "text": "", "bn_source": true}'
+        )
 
         # The fetch should never happen — if it does, this fails.
         with patch("src.video_utils.httpx.Client") as ClientCls:
@@ -203,6 +208,59 @@ class TestHydrateWordCacheFromBnTranscript:
 
         assert ok is True
         ClientCls.assert_not_called()
+
+    def test_re_hydrates_when_cache_lacks_bn_marker(self, tmp_path):
+        """A cache without bn_source (e.g. left over from a prior AssemblyAI
+        run on the same path) is treated as stale and re-hydrated from BN.
+        Defense-in-depth against a path collision that shouldn't happen given
+        uuid-per-download but stays correct if that ever changes. (CR #32)"""
+        video_path = tmp_path / "video.mp4"
+        video_path.write_bytes(b"")
+        cache_path = tmp_path / "video.transcript_cache.json"
+        cache_path.write_text(
+            '{"version": 2, "words": [{"text": "stale", "start": 0, "end": 100, "confidence": 1.0, "speaker": "A"}], "utterances": [], "text": "stale"}'
+        )
+
+        bn_payload = {
+            "transcript": "fresh",
+            "words": [_bn_word("fresh", 0.0, 0.4)],
+        }
+
+        with patch("src.video_utils.httpx.Client") as ClientCls:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = bn_payload
+            ClientCls.return_value.__enter__.return_value.get.return_value = mock_response
+
+            ok = hydrate_word_cache_from_bn_transcript(video_path, "https://signed.example/url")
+
+        assert ok is True
+        cached = json.loads(cache_path.read_text())
+        assert cached["bn_source"] is True
+        assert cached["text"] == "fresh"  # overwritten, not stale
+
+    def test_writes_bn_source_marker(self, tmp_path):
+        """Every BN-hydrated cache carries `bn_source: True` for the
+        existence-check distinction. (CR #32)"""
+        video_path = tmp_path / "video.mp4"
+        video_path.write_bytes(b"")
+        cache_path = tmp_path / "video.transcript_cache.json"
+
+        bn_payload = {
+            "transcript": "Hello",
+            "words": [_bn_word("Hello", 0.0, 0.4)],
+        }
+
+        with patch("src.video_utils.httpx.Client") as ClientCls:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = bn_payload
+            ClientCls.return_value.__enter__.return_value.get.return_value = mock_response
+
+            hydrate_word_cache_from_bn_transcript(video_path, "https://signed.example/url")
+
+        cached = json.loads(cache_path.read_text())
+        assert cached["bn_source"] is True
 
     def test_returns_false_when_fetch_fails(self, tmp_path):
         video_path = tmp_path / "video.mp4"

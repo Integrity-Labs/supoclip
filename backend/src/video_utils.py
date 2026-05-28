@@ -502,11 +502,33 @@ def hydrate_word_cache_from_bn_transcript(
     """
     cache_path = video_path.with_suffix(".transcript_cache.json")
     if cache_path.exists():
-        logger.info(
-            "Local transcript cache already present at %s; skipping BN hydrate",
-            cache_path,
-        )
-        return True
+        # Defense-in-depth: only short-circuit when the cache was actually
+        # written by a prior BN-hydrate (carries the `bn_source` marker).
+        # In practice `video_path` is a per-run uuid so collisions with a
+        # stale AssemblyAI cache shouldn't occur (`download_remote_video`
+        # generates a fresh uuid per call), but validating the marker means
+        # the helper stays correct if that assumption ever changes. A cache
+        # missing the marker is treated as stale → re-hydrate from BN.
+        # (ENG-5686 / CR #32 review.)
+        try:
+            with open(cache_path, "r") as f:
+                existing = json.load(f)
+            if existing.get("bn_source") is True:
+                logger.info(
+                    "BN-hydrated transcript cache already present at %s; skipping re-fetch",
+                    cache_path,
+                )
+                return True
+            logger.info(
+                "Transcript cache at %s lacks bn_source marker; treating as stale and re-hydrating",
+                cache_path,
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Failed to inspect existing transcript cache %s: %s. Re-hydrating from BN.",
+                cache_path,
+                exc,
+            )
 
     try:
         runtime_config = get_config()
@@ -554,6 +576,12 @@ def hydrate_word_cache_from_bn_transcript(
             video_path,
         )
         return False
+
+    # Stamp a `bn_source` marker so the existence-short-circuit above can
+    # tell BN-hydrated caches from stale AssemblyAI ones at the same path.
+    # `load_cached_transcript_data` doesn't read this field, so downstream
+    # subtitle/diarization code is unaffected. (ENG-5686 / CR #32 review.)
+    cache_data["bn_source"] = True
 
     with open(cache_path, "w") as f:
         json.dump(cache_data, f)
