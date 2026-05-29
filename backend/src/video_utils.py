@@ -2161,10 +2161,28 @@ def build_per_shot_cut_plan(
     motion_passes = 0
     last_framed_x: Optional[int] = None
     raw_segments: List[Dict[str, Any]] = []
-    for shot_start, shot_end in shots:
+    # ENG-5719: per-shot debug accumulator. Captures what the algorithm "saw"
+    # at every decision point — sampled face centers with confidence, which
+    # branch fired (two-shot-cut / single-frame / no-faces), and the X target
+    # selected. Lifted from logs to a structured sidecar so the local
+    # crop_overlay.py script can render an annotated MP4 of the source with
+    # the crop window + face detections drawn on it. The format is
+    # intentionally verbose — we'd rather over-capture than re-run for missing
+    # signal.
+    debug_shots: List[Dict[str, Any]] = []
+    for shot_index, (shot_start, shot_end) in enumerate(shots):
         faces = detect_faces_in_clip(
             clip_path, shot_start, min(shot_end, shot_start + shot_sample_cap)
         )
+        face_centers_dump = [
+            {
+                "center_x": int(fx),
+                "center_y": int(fy),
+                "area": int(area),
+                "confidence": float(conf),
+            }
+            for fx, fy, area, conf in faces
+        ]
         # A held two-shot (two distinct, far-apart face clusters): cut between the two
         # people by who is speaking, rather than holding on the dominant one.
         regions = cluster_two_face_regions(faces, width, height)
@@ -2182,6 +2200,34 @@ def build_per_shot_cut_plan(
                     shot_end,
                     len(shot_segments),
                 )
+                debug_shots.append(
+                    {
+                        "shot_index": shot_index,
+                        "start": shot_start,
+                        "end": shot_end,
+                        "face_count": len(faces),
+                        "face_centers": face_centers_dump,
+                        "mode": "two-shot-cut",
+                        "regions": {
+                            "left": {
+                                "center_x": int(regions["left"]["center_x"]),
+                                "center_y": int(regions["left"].get("center_y", 0)),
+                            },
+                            "right": {
+                                "center_x": int(regions["right"]["center_x"]),
+                                "center_y": int(regions["right"].get("center_y", 0)),
+                            },
+                        },
+                        "sub_segments": [
+                            {
+                                "start": float(seg["start"]),
+                                "end": float(seg["end"]),
+                                "x": int(seg["x"]),
+                            }
+                            for seg in shot_segments
+                        ],
+                    }
+                )
                 continue
 
         # Always centre on a face when the shot has one (even a single/imperfect
@@ -2198,11 +2244,33 @@ def build_per_shot_cut_plan(
                 len(faces),
                 crop_x,
             )
+            debug_shots.append(
+                {
+                    "shot_index": shot_index,
+                    "start": shot_start,
+                    "end": shot_end,
+                    "face_count": len(faces),
+                    "face_centers": face_centers_dump,
+                    "mode": "single-frame",
+                    "x_target": int(crop_x),
+                }
+            )
         else:
             logger.info(
                 "vertical (per-shot): %.1f-%.1fs no faces -> hold neighbour",
                 shot_start,
                 shot_end,
+            )
+            debug_shots.append(
+                {
+                    "shot_index": shot_index,
+                    "start": shot_start,
+                    "end": shot_end,
+                    "face_count": len(faces),
+                    "face_centers": face_centers_dump,
+                    "mode": "no-faces",
+                    "x_target": None,
+                }
             )
         raw_segments.append({"start": shot_start, "end": shot_end, "x": crop_x})
 
@@ -2230,6 +2298,28 @@ def build_per_shot_cut_plan(
         "crop_h": height,
         "x_expression": build_step_x_expression(merged),
         "timeline": merged,
+        # ENG-5719: structured replay of the per-shot decisions. Consumed by
+        # render_reframed_clip_ffmpeg, which writes it to a sidecar JSON next
+        # to the rendered clip and serves it via the reframe-plan endpoint.
+        "debug": {
+            "schema_version": 1,
+            "mode": "cut",
+            "source_width": width,
+            "source_height": height,
+            "source_duration": duration,
+            "crop_w": crop_w,
+            "crop_h": height,
+            "scene_cut_times": [float(t) for t in cut_times],
+            "shots": debug_shots,
+            "merged_timeline": [
+                {
+                    "start": float(seg["start"]),
+                    "end": float(seg["end"]),
+                    "x": int(seg["x"]),
+                }
+                for seg in merged
+            ],
+        },
     }
 
 
@@ -2384,6 +2474,21 @@ def render_reframed_clip_ffmpeg(
         if output_format in {"vertical", "vertical_pan", "vertical_split"}
         else None
     )
+    # ENG-5719: persist the per-shot decision trace alongside the rendered
+    # clip BEFORE invoking ffmpeg, so the sidecar is present even if the
+    # encode itself fails (helps diagnose render errors that depend on the
+    # plan shape). Served via GET /tasks/{task_id}/clips/{clip_id}/reframe-plan
+    # and consumed by the local crop_overlay.py diagnostic.
+    if plan and plan.get("debug"):
+        sidecar_path = output_path.with_suffix(".reframe_plan.json")
+        try:
+            with open(sidecar_path, "w") as f:
+                json.dump(plan["debug"], f, indent=2)
+            logger.info("Wrote reframe debug sidecar to %s", sidecar_path)
+        except Exception as exc:
+            # Sidecar write failure must NOT block the render — it's a
+            # diagnostic, not a deliverable.
+            logger.warning("Failed to write reframe debug sidecar %s: %s", sidecar_path, exc)
     if plan and plan["mode"] in {"pan", "cut"}:
         video_filter = (
             f"crop={plan['crop_w']}:{plan['crop_h']}:x='{plan['x_expression']}':y=0,"
