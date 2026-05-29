@@ -654,6 +654,69 @@ async def get_clip_file(
         raise HTTPException(status_code=500, detail=f"Error serving clip file: {str(e)}")
 
 
+@router.get("/{task_id}/clips/{clip_id}/reframe-plan")
+async def get_clip_reframe_plan(
+    task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Serve the per-shot reframe debug sidecar JSON for a rendered clip.
+
+    Written by `render_reframed_clip_ffmpeg` next to the .mp4 file as
+    `<clip>.reframe_plan.json` when the reframe plan includes debug data
+    (currently the per-shot `cut` mode — see ``build_per_shot_cut_plan``).
+    Consumed by the local ``scripts/crop_overlay.py`` diagnostic which
+    renders an annotated MP4 of the source video with the chosen crop
+    window + detected face centers drawn on it.
+
+    Returns 404 when:
+        - the clip doesn't exist or isn't owned by the caller
+        - the clip was rendered with a non-cut reframe mode (no sidecar
+          written; the mode field will tell the caller why)
+        - the sidecar file was deleted/moved (transient — sidecar lives
+          on local /tmp, not S3, and is wiped on container restart per
+          ``reference_supoclip_retry_transcript_cache_loss`` rules)
+
+    (ENG-5719)
+    """
+    try:
+        task_service = TaskService(db)
+        await _require_task_owner(request, task_service, db, task_id)
+        clip = await task_service.clip_repo.get_clip_by_id(db, clip_id)
+        if not clip or clip.get("task_id") != task_id:
+            raise HTTPException(status_code=404, detail="Clip not found")
+
+        from ...storage import get_storage
+
+        clip_path = await get_storage().resolve(clip["file_path"])
+        # Sidecar lives next to the .mp4 with `.reframe_plan.json` suffix.
+        # Use `with_suffix` rather than string ops so we handle paths with
+        # multiple dots correctly (e.g. clip.v2.mp4 → clip.v2.reframe_plan.json).
+        sidecar_path = clip_path.with_suffix(".reframe_plan.json")
+        if not sidecar_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Reframe plan not found — either the clip used a non-cut "
+                    "reframe mode (vertical_pan, vertical_split, or static "
+                    "fallback all skip the debug sidecar), or the sidecar "
+                    "was wiped on container restart."
+                ),
+            )
+
+        return FileResponse(
+            path=str(sidecar_path),
+            media_type="application/json",
+            content_disposition_type="inline",
+            headers={"Cache-Control": "private, no-store"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving clip reframe plan: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Error serving clip reframe plan: {str(e)}"
+        )
+
+
 @router.patch("/{task_id}/clips/{clip_id}")
 async def trim_clip(
     task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
