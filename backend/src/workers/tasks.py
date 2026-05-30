@@ -31,8 +31,12 @@ async def process_video_task(
     stroke_color: str | None = None,
     max_clips: int | None = None,
     subtitle_position_y: float | None = None,
-    subtitle_top_y: float | None = None,
     transcript_url: str | None = None,
+    # New args go at the END of the signature: arq stores enqueued jobs with
+    # positional kwargs, so inserting a param between existing ones would shift
+    # all later values on replay (CodeRabbit catch on PR #38). Anything new
+    # appended here is safe — older jobs simply default to None for it.
+    subtitle_top_y: float | None = None,
 ) -> Dict[str, Any]:
     """
     Background worker task to process a video.

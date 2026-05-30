@@ -363,8 +363,8 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
             stroke_color,
             max_clips,
             subtitle_position_y,
-            subtitle_top_y,
             transcript_url,
+            subtitle_top_y,
         )
 
         # Save source metadata for resume/retries in environments without sources.url column
