@@ -1628,6 +1628,7 @@ def build_assemblyai_ass_subtitles(
     highlight_color: Optional[str] = None,
     stroke_color: Optional[str] = None,
     subtitle_position_y: Optional[float] = None,
+    subtitle_top_y: Optional[float] = None,
 ) -> bool:
     """Generate ASS subtitles from cached AssemblyAI word timings.
 
@@ -1639,7 +1640,16 @@ def build_assemblyai_ass_subtitles(
     placeholder element in the source template's Polotno doc so designers
     control caption placement visually rather than living with the
     caption_template's hardcoded default (0.75 / lower-third). None keeps
-    the template default. (ENG-5671)"""
+    the template default. Centre-anchored: the caption's vertical centre lands
+    at `video_height * subtitle_position_y`. (ENG-5671)
+
+    subtitle_top_y is the **top-anchored** variant: when set, the caption's
+    top edge lands at `video_height * subtitle_top_y` (no half-text-height
+    offset). Designers in BN place a `subtitles` placeholder where they want
+    the caption to *start*, and the helper sends the placeholder's top-Y. This
+    wins over `subtitle_position_y` when both are supplied. Implemented by
+    switching the ASS style's `Alignment` from `5` (middle-centre) to `8`
+    (top-centre) so `\\pos(x, y)` anchors at the text top. (ENG-5760)"""
     transcript_data = load_cached_transcript_data(video_path)
     if not transcript_data or not transcript_data.get("words"):
         logger.warning("No cached transcript data available for ASS subtitles")
@@ -1674,12 +1684,20 @@ def build_assemblyai_ass_subtitles(
     shadow_px = 2 if template.get("shadow") else 0
     # Caller-supplied position wins so a BN template placeholder can override
     # the caption_template's baked default without per-template forks.
-    pos_y = (
-        float(subtitle_position_y)
-        if subtitle_position_y is not None
-        else float(template.get("position_y", 0.75))
-    )
-    pos_y = max(0.0, min(1.0, pos_y))
+    # subtitle_top_y (top-anchor, ENG-5760) wins over subtitle_position_y
+    # (centre-anchor, ENG-5671); ASS Alignment flips 5→8 so `\pos(x, y)` then
+    # references the caption's top edge instead of its centre.
+    if subtitle_top_y is not None:
+        pos_y = max(0.0, min(1.0, float(subtitle_top_y)))
+        ass_alignment = 8  # top-centre
+    else:
+        pos_y = (
+            float(subtitle_position_y)
+            if subtitle_position_y is not None
+            else float(template.get("position_y", 0.75))
+        )
+        pos_y = max(0.0, min(1.0, pos_y))
+        ass_alignment = 5  # middle-centre (legacy)
     y_pos = int(video_height * pos_y)
     font_name = ass_font_name(effective_font_family)
     border_style = resolve_border_style(template, stroke_color)
@@ -1693,7 +1711,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font_name},{font_px},{primary},&H000000FF,{outline},{back_color},1,0,0,0,100,100,0,0,{border_style},{outline_px},{shadow_px},5,60,60,60,1
+Style: Default,{font_name},{font_px},{primary},&H000000FF,{outline},{back_color},1,0,0,0,100,100,0,0,{border_style},{outline_px},{shadow_px},{ass_alignment},60,60,60,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -3423,12 +3441,16 @@ def create_optimized_clip(
     highlight_color: Optional[str] = None,
     stroke_color: Optional[str] = None,
     subtitle_position_y: Optional[float] = None,
+    subtitle_top_y: Optional[float] = None,
 ) -> bool:
     """Create clip with optional subtitles. output_format: 'vertical' (9:16, hard-cut
     speaker reframing) or 'horizontal' (keep source 16:9; 'original' is an alias).
 
     highlight_color / stroke_color override the caption template's active-word
-    and outline colours; None keeps the template default."""
+    and outline colours; None keeps the template default.
+
+    subtitle_top_y (ENG-5760) is the top-anchored caption position — wins over
+    subtitle_position_y when both are set; see build_assemblyai_ass_subtitles."""
     try:
         if keep_ranges:
             effective_keep_ranges = normalize_source_ranges(keep_ranges)
@@ -3524,6 +3546,7 @@ def create_optimized_clip(
                 highlight_color,
                 stroke_color,
                 subtitle_position_y,
+                subtitle_top_y,
             ):
                 if not burn_ass_subtitles_ffmpeg(
                     framed_clip_path,

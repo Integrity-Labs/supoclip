@@ -283,6 +283,14 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
     subtitle_position_y: Optional[float] = None
     if isinstance(raw_position_y, (int, float)) and not isinstance(raw_position_y, bool):
         subtitle_position_y = max(0.0, min(1.0, float(raw_position_y)))
+    # subtitle_top_y is the top-anchored variant: caption's TOP edge lands at
+    # `video_height * subtitle_top_y`. BN sends `placeholder.y / pageHeight`
+    # so what designers see (placeholder text top) is where captions appear.
+    # Wins over subtitle_position_y in the renderer. (ENG-5760)
+    raw_top_y = data.get("subtitle_top_y")
+    subtitle_top_y: Optional[float] = None
+    if isinstance(raw_top_y, (int, float)) and not isinstance(raw_top_y, bool):
+        subtitle_top_y = max(0.0, min(1.0, float(raw_top_y)))
     cleanup_settings = normalize_clip_cleanup_settings(
         data.get("cut_long_pauses"),
         data.get("pause_threshold_ms"),
@@ -356,6 +364,7 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
             max_clips,
             subtitle_position_y,
             transcript_url,
+            subtitle_top_y,
         )
 
         # Save source metadata for resume/retries in environments without sources.url column

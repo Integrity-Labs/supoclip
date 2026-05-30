@@ -200,6 +200,7 @@ class TaskService:
         stroke_color: Optional[str] = None,
         max_clips: Optional[int] = None,
         subtitle_position_y: Optional[float] = None,
+        subtitle_top_y: Optional[float] = None,
         transcript_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -398,6 +399,7 @@ class TaskService:
                     highlight_color,
                     stroke_color,
                     subtitle_position_y,
+                    subtitle_top_y,
                 )
                 if clip_info is None:
                     continue  # Skip failed clip

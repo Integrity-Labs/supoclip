@@ -237,6 +237,106 @@ def test_build_assemblyai_ass_subtitles_uses_cached_word_timings(tmp_path):
     assert "Dialogue:" in content
 
 
+def _write_simple_transcript(video_path: Path) -> None:
+    video_path.with_suffix(".transcript_cache.json").write_text(
+        """
+        {
+          "version": 2,
+          "words": [
+            {"text": "hello", "start": 0, "end": 400, "confidence": 0.99}
+          ],
+          "utterances": [],
+          "text": "hello"
+        }
+        """,
+        encoding="utf-8",
+    )
+
+
+def test_build_ass_subtitles_subtitle_top_y_uses_top_anchor_alignment(tmp_path):
+    """subtitle_top_y switches ASS Alignment to 8 (top-centre) so {\\pos(x,y)}
+    references the caption's top edge instead of its centre.
+    Without subtitle_top_y, alignment stays at 5 (middle-centre, legacy).
+    (ENG-5760)"""
+    video_path = tmp_path / "source.mp4"
+    _write_simple_transcript(video_path)
+    ass_path = tmp_path / "captions.ass"
+
+    success = video_utils.build_assemblyai_ass_subtitles(
+        video_path,
+        clip_start=0.0,
+        clip_end=1.0,
+        video_width=1080,
+        video_height=1920,
+        output_ass_path=ass_path,
+        caption_template="default",
+        keep_ranges=[(0.0, 1.0)],
+        subtitle_top_y=0.4,
+    )
+
+    content = ass_path.read_text(encoding="utf-8")
+    assert success is True
+    # ASS Style row format ends with `,...,Alignment,MarginL,MarginR,MarginV,Encoding`.
+    # With subtitle_top_y set we expect alignment 8 (top-centre).
+    style_line = next(line for line in content.splitlines() if line.startswith("Style: Default,"))
+    assert ",8,60,60,60,1" in style_line
+    # y_pos = int(1920 * 0.4) = 768 → \pos(540,768)
+    assert "\\pos(540,768)" in content
+
+
+def test_build_ass_subtitles_subtitle_top_y_wins_over_position_y(tmp_path):
+    """When both are supplied, subtitle_top_y wins (top-anchored) and
+    subtitle_position_y is ignored — the renderer must pick one anchor."""
+    video_path = tmp_path / "source.mp4"
+    _write_simple_transcript(video_path)
+    ass_path = tmp_path / "captions.ass"
+
+    success = video_utils.build_assemblyai_ass_subtitles(
+        video_path,
+        clip_start=0.0,
+        clip_end=1.0,
+        video_width=1080,
+        video_height=1920,
+        output_ass_path=ass_path,
+        caption_template="default",
+        keep_ranges=[(0.0, 1.0)],
+        subtitle_position_y=0.9,  # would be y_pos=1728 under legacy path
+        subtitle_top_y=0.25,       # wins: y_pos=480
+    )
+
+    content = ass_path.read_text(encoding="utf-8")
+    assert success is True
+    assert "\\pos(540,480)" in content
+    assert "\\pos(540,1728)" not in content
+
+
+def test_build_ass_subtitles_without_top_y_keeps_centre_anchor(tmp_path):
+    """Legacy path (no subtitle_top_y) keeps Alignment=5 so existing
+    callers — including BN's subtitle_position_y flow from ENG-5671 —
+    continue to render captions centred at the given ratio."""
+    video_path = tmp_path / "source.mp4"
+    _write_simple_transcript(video_path)
+    ass_path = tmp_path / "captions.ass"
+
+    success = video_utils.build_assemblyai_ass_subtitles(
+        video_path,
+        clip_start=0.0,
+        clip_end=1.0,
+        video_width=1080,
+        video_height=1920,
+        output_ass_path=ass_path,
+        caption_template="default",
+        keep_ranges=[(0.0, 1.0)],
+        subtitle_position_y=0.5,
+    )
+
+    content = ass_path.read_text(encoding="utf-8")
+    assert success is True
+    style_line = next(line for line in content.splitlines() if line.startswith("Style: Default,"))
+    assert ",5,60,60,60,1" in style_line
+    assert "\\pos(540,960)" in content  # int(1920 * 0.5)
+
+
 def test_ass_font_name_uses_internal_font_family():
     assert video_utils.ass_font_name("THEBOLDFONT") == "THE BOLD FONT (FREE VERSION)"
 
