@@ -12,9 +12,12 @@ import logging
 from typing import Any, Dict, Optional
 import inspect
 import ipaddress
+import os
 import re
 import socket
 from urllib.parse import urlparse
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 from ...database import get_db
 from ...database import AsyncSessionLocal
@@ -654,6 +657,24 @@ async def get_clip_file(
         raise HTTPException(status_code=500, detail=f"Error serving clip file: {str(e)}")
 
 
+def _reframe_sidecar_uri_from_clip(clip_uri: str) -> str:
+    """Derive the sidecar's storage URI from the clip's storage URI.
+
+    Works against both local paths and ``s3://`` URIs by splitting on the
+    last ``.`` of the basename via ``os.path.splitext``. ``pathlib.Path``
+    can't be used here because it mangles ``s3://`` (treats ``s3:`` as part
+    of the path). For local paths the result is equivalent to
+    ``Path(clip_uri).with_suffix('.reframe_plan.json')``.
+
+    Examples:
+        ``s3://bucket/clips/abc.mp4``      -> ``s3://bucket/clips/abc.reframe_plan.json``
+        ``/tmp/clips/abc.mp4``             -> ``/tmp/clips/abc.reframe_plan.json``
+        ``./clips/abc``  (no extension)    -> ``./clips/abc.reframe_plan.json``
+    """
+    base, _ext = os.path.splitext(clip_uri)
+    return f"{base}.reframe_plan.json"
+
+
 @router.get("/{task_id}/clips/{clip_id}/reframe-plan")
 async def get_clip_reframe_plan(
     task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
@@ -663,6 +684,9 @@ async def get_clip_reframe_plan(
     Written by `render_reframed_clip_ffmpeg` next to the .mp4 file as
     `<clip>.reframe_plan.json` when the reframe plan includes debug data
     (currently the per-shot `cut` mode — see ``build_per_shot_cut_plan``).
+    ``create_optimized_clip`` rescues it from the temp render dir to the
+    clip's persistent location, then ``task_service.save_clips_to_storage``
+    promotes it to S3 alongside the clip when STORAGE_BUCKET is set.
     Consumed by the local ``scripts/crop_overlay.py`` diagnostic which
     renders an annotated MP4 of the source video with the chosen crop
     window + detected face centers drawn on it.
@@ -670,10 +694,9 @@ async def get_clip_reframe_plan(
     Returns 404 when:
         - the clip doesn't exist or isn't owned by the caller
         - the clip was rendered with a non-cut reframe mode (no sidecar
-          written; the mode field will tell the caller why)
-        - the sidecar file was deleted/moved (transient — sidecar lives
-          on local /tmp, not S3, and is wiped on container restart per
-          ``reference_supoclip_retry_transcript_cache_loss`` rules)
+          was written by the algorithm)
+        - the clip pre-dates the sidecar persistence change (Old runs lived
+          on /tmp only and got cleaned up; that's ENG-5719 Phase 1.)
 
     (ENG-5719)
     """
@@ -686,19 +709,33 @@ async def get_clip_reframe_plan(
 
         from ...storage import get_storage
 
-        clip_path = await get_storage().resolve(clip["file_path"])
-        # Sidecar lives next to the .mp4 with `.reframe_plan.json` suffix.
-        # Use `with_suffix` rather than string ops so we handle paths with
-        # multiple dots correctly (e.g. clip.v2.mp4 → clip.v2.reframe_plan.json).
-        sidecar_path = clip_path.with_suffix(".reframe_plan.json")
+        # Derive the sidecar's storage URI from the clip's storage URI, then
+        # let storage.resolve() handle the local-vs-S3 download. This is the
+        # same pattern get_clip_file uses for the .mp4 itself.
+        clip_uri = clip["file_path"]
+        sidecar_uri = _reframe_sidecar_uri_from_clip(clip_uri)
+        try:
+            sidecar_path = await get_storage().resolve(sidecar_uri)
+        except (BotoCoreError, ClientError) as exc:
+            # Treat any S3 miss the same as "no sidecar" — most likely the
+            # clip pre-dates the persistence change.
+            logger.info("Sidecar not found in storage (%s): %s", sidecar_uri, exc)
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Reframe plan not found — either the clip used a non-cut "
+                    "reframe mode (vertical_pan / vertical_split / static "
+                    "fallback don't emit debug data), or the clip pre-dates "
+                    "the sidecar persistence change (ENG-5719)."
+                ),
+            )
+
         if not sidecar_path.exists():
             raise HTTPException(
                 status_code=404,
                 detail=(
                     "Reframe plan not found — either the clip used a non-cut "
-                    "reframe mode (vertical_pan, vertical_split, or static "
-                    "fallback all skip the debug sidecar), or the sidecar "
-                    "was wiped on container restart."
+                    "reframe mode, or the local sidecar file was deleted."
                 ),
             )
 

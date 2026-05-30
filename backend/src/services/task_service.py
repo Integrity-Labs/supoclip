@@ -411,6 +411,26 @@ class TaskService:
                 local_clip_path = Path(clip_info["path"])
                 stored_path = await storage.save(local_clip_path)
 
+                # ENG-5719: also persist the per-shot reframe debug sidecar so
+                # we can inspect this clip's framing decisions any time later
+                # (the /reframe-plan endpoint will resolve via storage the same
+                # way the /file endpoint does). Sidecar is `<clip>.reframe_plan.json`
+                # — same naming convention render_reframed_clip_ffmpeg writes
+                # and the endpoint reads via `with_suffix`. Stored under the
+                # same key prefix as the clip so the URI derivation works.
+                # Best-effort: a missing or failed sidecar save MUST NOT block
+                # the clip — the user-visible deliverable is the video.
+                local_sidecar_path = local_clip_path.with_suffix(".reframe_plan.json")
+                if local_sidecar_path.exists():
+                    try:
+                        await storage.save(local_sidecar_path)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to persist reframe sidecar for clip %s: %s",
+                            clip_info.get("filename"),
+                            exc,
+                        )
+
                 # Save to DB immediately
                 clip_id = await self.clip_repo.create_clip(
                     self.db,
