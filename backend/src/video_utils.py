@@ -2215,16 +2215,34 @@ def build_two_shot_segments(
     crop_w: int,
     width: int,
     utterances: List[Dict[str, Any]],
-) -> Optional[List[Dict[str, Any]]]:
+) -> Dict[str, Any]:
     """Speaker-select within a held two-shot.
 
     Runs the lip-motion pass scoped to the shot and uses the diarized utterances to cut
     between the two people by who is talking — when two speakers share the shot — or to
-    frame the talking (higher-motion) person when only one speaks. Returns clip-relative
-    {start, end, x} segments, or ``None`` to fall back to dominant framing.
+    frame the talking (higher-motion) person when only one speaks.
+
+    Returns a result dict::
+
+        {
+            "segments": Optional[List[{start, end, x}]],  # None when the speaker-cut path can't be built
+            "fallback_reason": Optional[str],              # set when segments is None — why we bailed
+            "dominant_side": Optional[str],                # "left"/"right" — usable as a speaker-aware
+                                                           # single-frame fallback whenever lip motion ran,
+                                                           # even when segments is None
+        }
+
+    ENG-5751: the previous shape (``Optional[List]``) lost the *reason* the cut couldn't
+    be built and discarded the lip-motion totals — so the caller's only fallback was the
+    generic ``pick_shot_crop_x``, which on a stable L+R shot deterministically picks the
+    leftmost (largest/clearest) face and crops the right speaker out for the whole shot.
+    The richer result lets the caller frame on whichever side actually has motion.
     """
     left_x = clamp_even(regions["left"]["center_x"] - crop_w // 2, 0, max(0, width - crop_w))
     right_x = clamp_even(regions["right"]["center_x"] - crop_w // 2, 0, max(0, width - crop_w))
+
+    def fail(reason: str, dominant_side: Optional[str] = None) -> Dict[str, Any]:
+        return {"segments": None, "fallback_reason": reason, "dominant_side": dominant_side}
 
     shot_utterances: List[Dict[str, Any]] = []
     for utterance in utterances:
@@ -2239,29 +2257,43 @@ def build_two_shot_segments(
                 }
             )
     if not shot_utterances:
-        return None
+        # No diarization overlap — we still want to try lip-motion to pick a side.
+        motion = measure_region_motion(
+            clip_path, regions["left"], regions["right"], start=shot_start, duration=shot_end - shot_start
+        )
+        if motion is None:
+            return fail("no_utterances_motion_unavailable")
+        _, left_values, right_values = motion
+        dominant = "left" if sum(left_values) >= sum(right_values) else "right"
+        return fail("no_utterances", dominant_side=dominant)
 
     motion = measure_region_motion(
         clip_path, regions["left"], regions["right"], start=shot_start, duration=shot_end - shot_start
     )
     if motion is None:
-        return None
+        return fail("motion_unavailable")
     times, left_values, right_values = motion
+    dominant = "left" if sum(left_values) >= sum(right_values) else "right"
 
     if len({utterance["speaker"] for utterance in shot_utterances}) >= 2:
         label_to_side = map_speaker_labels_to_sides(
             shot_utterances, times, left_values, right_values
         )
         if len(set(label_to_side.values())) < 2:
-            return None
+            return fail("single_side_speakers", dominant_side=dominant)
         timeline = build_speaker_timeline_from_utterances(shot_utterances, label_to_side)
         if len(timeline) < 2:
-            return None
-        return sides_timeline_to_x_segments(timeline, shot_start, shot_end, left_x, right_x)
+            return fail("short_timeline", dominant_side=dominant)
+        segments = sides_timeline_to_x_segments(timeline, shot_start, shot_end, left_x, right_x)
+        return {"segments": segments, "fallback_reason": None, "dominant_side": dominant}
 
-    # Single speaker holding a two-shot: frame the talking (higher-motion) person.
-    chosen_x = left_x if sum(left_values) >= sum(right_values) else right_x
-    return [{"start": shot_start, "end": shot_end, "x": chosen_x}]
+    # Single diarized speaker holding a two-shot: frame the talking (higher-motion) person.
+    chosen_x = left_x if dominant == "left" else right_x
+    return {
+        "segments": [{"start": shot_start, "end": shot_end, "x": chosen_x}],
+        "fallback_reason": None,
+        "dominant_side": dominant,
+    }
 
 
 def fill_weak_shot_framing(
@@ -2340,11 +2372,25 @@ def build_per_shot_cut_plan(
         # A held two-shot (two distinct, far-apart face clusters): cut between the two
         # people by who is speaking, rather than holding on the dominant one.
         regions = cluster_two_face_regions(faces, width, height)
-        if regions is not None and motion_passes < max_motion_passes:
+        # ENG-5751: when the speaker-cut path can't be built, capture the *reason* and
+        # any lip-motion-derived dominant side. The dominant side feeds a speaker-aware
+        # single-frame fallback below — without it, ``pick_shot_crop_x`` would silently
+        # pick the heaviest face (almost always the left/clearer one) and crop the right
+        # speaker out of frame on every stable L+R shot.
+        two_shot_fallback_reason: Optional[str] = None
+        two_shot_dominant_side: Optional[str] = None
+        if regions is None:
+            two_shot_fallback_reason = "no_regions"
+        elif motion_passes >= max_motion_passes:
+            two_shot_fallback_reason = "motion_pass_cap"
+        else:
             motion_passes += 1
-            shot_segments = build_two_shot_segments(
+            result = build_two_shot_segments(
                 clip_path, shot_start, shot_end, regions, crop_w, width, utterances
             )
+            shot_segments = result["segments"]
+            two_shot_fallback_reason = result["fallback_reason"]
+            two_shot_dominant_side = result["dominant_side"]
             if shot_segments:
                 raw_segments.extend(shot_segments)
                 last_framed_x = shot_segments[-1]["x"]
@@ -2384,6 +2430,46 @@ def build_per_shot_cut_plan(
                 )
                 continue
 
+        # ENG-5751: speaker-aware single-frame fallback. If we have a valid L+R region
+        # split and lip-motion ran (``two_shot_dominant_side`` set), frame the entire
+        # shot on the side with more motion. This catches the "stable L+R two-shot,
+        # both speakers visible, build_two_shot_segments returned None" case where the
+        # plain pick_shot_crop_x heuristic would always land on the left speaker.
+        if regions is not None and two_shot_dominant_side is not None:
+            chosen_x = clamp_even(
+                regions[two_shot_dominant_side]["center_x"] - crop_w // 2,
+                0,
+                max(0, width - crop_w),
+            )
+            last_framed_x = chosen_x
+            raw_segments.append({"start": shot_start, "end": shot_end, "x": chosen_x})
+            logger.info(
+                "vertical (per-shot): %.1f-%.1fs single-frame (speaker-aware, dom=%s, reason=%s) -> x=%d",
+                shot_start,
+                shot_end,
+                two_shot_dominant_side,
+                two_shot_fallback_reason,
+                chosen_x,
+            )
+            debug_shots.append(
+                {
+                    "shot_index": shot_index,
+                    "start": shot_start,
+                    "end": shot_end,
+                    "face_count": len(faces),
+                    "face_centers": face_centers_dump,
+                    "mode": "single-frame",
+                    "x_target": int(chosen_x),
+                    "fallback_reason": two_shot_fallback_reason,
+                    "chosen_speaker_side": two_shot_dominant_side,
+                    "regions": {
+                        "left": {"center_x": int(regions["left"]["center_x"])},
+                        "right": {"center_x": int(regions["right"]["center_x"])},
+                    },
+                }
+            )
+            continue
+
         # Always centre on a face when the shot has one (even a single/imperfect
         # detection) — a slightly-wrong face beats framing the empty gap. pick_shot_crop_x
         # returns None only for a genuinely faceless shot, which fill_weak_shot_framing
@@ -2407,6 +2493,10 @@ def build_per_shot_cut_plan(
                     "face_centers": face_centers_dump,
                     "mode": "single-frame",
                     "x_target": int(crop_x),
+                    # ENG-5751: record why we skipped the speaker-cut path so any
+                    # future single-frame regressions can be diagnosed from sidecar
+                    # alone. None means "regions clustered cleanly, the cut just landed".
+                    "fallback_reason": two_shot_fallback_reason,
                 }
             )
         else:
