@@ -3229,6 +3229,31 @@ def create_optimized_clip(
             else:
                 shutil.move(str(framed_clip_path), str(output_path))
 
+            # ENG-5719: rescue the per-shot reframe debug sidecar from the
+            # temp render dir before the TemporaryDirectory context cleans
+            # it up. Without this, the sidecar is written to
+            # /tmp/supoclip_render_*/framed.reframe_plan.json by
+            # render_reframed_clip_ffmpeg, but deleted seconds later when
+            # this `with` block exits — making the diagnostic infrastructure
+            # only useful while a render is in flight. Moving it next to
+            # the final clip lets task_service.save_clips_to_storage upload
+            # it to S3 alongside the .mp4 (clip.with_suffix pattern), which
+            # makes it inspectable any time after the fact.
+            sidecar_temp = framed_clip_path.with_suffix(".reframe_plan.json")
+            if sidecar_temp.exists():
+                sidecar_final = output_path.with_suffix(".reframe_plan.json")
+                try:
+                    shutil.move(str(sidecar_temp), str(sidecar_final))
+                except OSError as exc:
+                    # Best-effort — never fail the render because we couldn't
+                    # rescue a diagnostic file.
+                    logger.warning(
+                        "Failed to move reframe sidecar %s -> %s: %s",
+                        sidecar_temp,
+                        sidecar_final,
+                        exc,
+                    )
+
             logger.info(f"Successfully created clip with ffmpeg: {output_path}")
             return True
 

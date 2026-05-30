@@ -149,6 +149,48 @@ class TestEscapeHelpers:
         assert crop_overlay._ff_time(8.612) == "8.612"
 
 
+class TestReframeSidecarUriFromClip:
+    """ENG-5719 Phase 2: the endpoint derives the sidecar's storage URI
+    from the clip's storage URI via os.path.splitext. Path.with_suffix
+    can't be used because it mangles s3:// URIs (treats s3: as a path
+    component)."""
+
+    def test_local_path(self):
+        from src.api.routes.tasks import _reframe_sidecar_uri_from_clip
+
+        assert (
+            _reframe_sidecar_uri_from_clip("/tmp/clips/abc.mp4")
+            == "/tmp/clips/abc.reframe_plan.json"
+        )
+
+    def test_s3_uri(self):
+        from src.api.routes.tasks import _reframe_sidecar_uri_from_clip
+
+        assert (
+            _reframe_sidecar_uri_from_clip("s3://bucket/clips/abc.mp4")
+            == "s3://bucket/clips/abc.reframe_plan.json"
+        )
+
+    def test_multi_dot_basename(self):
+        """Only the LAST .ext gets swapped so versioned filenames work."""
+        from src.api.routes.tasks import _reframe_sidecar_uri_from_clip
+
+        assert (
+            _reframe_sidecar_uri_from_clip("s3://bucket/clip.v2.mp4")
+            == "s3://bucket/clip.v2.reframe_plan.json"
+        )
+
+    def test_no_extension(self):
+        """Edge case: clip URI without an extension — append the sidecar
+        suffix rather than corrupting the basename."""
+        from src.api.routes.tasks import _reframe_sidecar_uri_from_clip
+
+        assert (
+            _reframe_sidecar_uri_from_clip("s3://bucket/abc")
+            == "s3://bucket/abc.reframe_plan.json"
+        )
+
+
 class TestPlanLoader:
     def test_loads_v1_plan_from_file(self, crop_overlay, tmp_path):
         plan = _make_plan()
