@@ -1065,7 +1065,23 @@ def detect_faces_in_clip(
 
         capture.release()
 
-        # Remove outliers (faces that are very far from the median position)
+        # Dedupe positional clusters first: a single static object misclassified
+        # as a face by the DNN gets detected at ~identical coordinates in every
+        # sampled frame, which without dedupe outvotes real speakers in
+        # downstream clustering (cluster_two_face_regions, pick_shot_crop_x).
+        # Real speakers move 5-15px between sampled frames (head pose, breath,
+        # gesture); a phantom is pixel-identical across all frames.
+        # Discovered on ENG-5719 job 9c4026d1 shot 8: 5 real detections of the
+        # left speaker (x~120) lost to 12 phantom detections at exactly
+        # (1105, 597) — a tablet/table area the DNN kept misclassifying.
+        # The crop landed at x=802 (middle of empty space) instead of the
+        # speaker. After dedupe: 1 left vote + 1 phantom vote, equally
+        # weighted, and the lip-motion pass identifies the phantom as
+        # non-moving (no lip activity) so the crop locks to the real speaker.
+        # Filter_face_outliers runs AFTER dedupe so its median-based heuristic
+        # isn't dominated by the over-counted phantom either.
+        if len(face_centers) > 2:
+            face_centers = dedupe_static_phantoms(face_centers)
         if len(face_centers) > 2:
             face_centers = filter_face_outliers(face_centers)
 
@@ -1075,6 +1091,144 @@ def detect_faces_in_clip(
     except Exception as e:
         logger.error(f"Error in face detection: {e}")
         return []
+
+
+def dedupe_static_phantoms(
+    face_centers: List[Tuple[int, int, int, float]],
+    radius: int = 80,
+) -> List[Tuple[int, int, int, float]]:
+    """Collapse positionally near-identical detections into ONE weighted observation.
+
+    Why this exists
+    ---------------
+    The DNN face detector occasionally misclassifies a static piece of furniture
+    (tablet, table edge, TV-screen logo) as a face. Because the object is
+    pixel-stable across the 10-12 frames we sample per shot, it produces 10-12
+    detections at *exactly* the same coordinates. Without dedupe, those count
+    as 10-12 separate votes in ``cluster_two_face_regions`` and
+    ``pick_shot_crop_x``, drowning out a real speaker who's only detected 4-6
+    times AND whose detections are scattered across a 10-15 pixel radius
+    (head pose, breath, gesture).
+
+    Empirically calibrated on ENG-5719 job ``9c4026d1`` (the "And, um, what
+    about the dogs?" clip):
+
+        Shot 8 raw detections:
+          5 real left-speaker detections, x≈87-156, conf 0.81-0.98
+         12 phantom detections at (1105, 597) ±2, conf 0.59-0.77
+
+        Resulting x_target=802 → crop window covered 802-1408, missing
+        all three visible speakers (left at x≈100, middle at x≈400, right
+        at x≈1750).
+
+    After dedupe:
+
+        Shot 8 deduped:
+          1 representative for the left-speaker cluster (median (122, 421), conf 0.93)
+          1 representative for the phantom (median (1105, 597), conf 0.73)
+
+        Now ``cluster_two_face_regions`` sees 2 zones and ``build_two_shot_segments``
+        runs lip-motion analysis per zone. The phantom has zero lip motion (it's
+        a tablet), so the speaker-cut algorithm locks framing onto the real
+        speaker zone every time.
+
+    Calibration of ``radius``
+    -------------------------
+    ``radius=80`` is chosen to be:
+      * **larger than typical inter-frame head movement spread over a shot**
+        — observed up to 69px on x and 27px on y in the calibration clip's
+        left-speaker cluster (head shifting plus camera micro-jitter compound
+        across the 12 sampled frames). Picking 80 leaves a margin for slightly
+        more animated speakers.
+      * **smaller than the inter-speaker distance** in a typical two-shot
+        frame at 1920×1080 — observed 500-1500px between speakers in the
+        calibration clip and ~990px between a real speaker and the phantom.
+        80px is well below either, so left and right speakers stay distinct
+        and phantoms in unrelated regions don't get merged with real faces.
+      * Initially set lower (35px) but real-speaker drift exceeded that and
+        a real speaker was incorrectly split into 2 clusters. Calibrating
+        against the production fixture was the only way to land the right
+        number.
+
+    Cluster aggregation
+    -------------------
+    Each cluster collapses to:
+      * x, y: median of the cluster's positions (robust to a single outlying
+        sample in the cluster)
+      * area: max of the cluster's areas (downstream cares more about the
+        largest visible face than the average)
+      * confidence: mean of the cluster's confidences
+
+    Greedy single-pass clustering is O(N²) worst-case but N is small (10-26
+    detections per shot typically) so it's not worth a kd-tree. (ENG-5719
+    Phase 3.)
+    """
+    if len(face_centers) < 2:
+        return face_centers
+
+    # Pass 1: greedy single-pass clustering against the running median.
+    # Catches the easy cases (phantom: identical pixels across N frames).
+    clusters: List[Dict[str, List]] = []
+    for fx, fy, area, conf in face_centers:
+        joined = False
+        for c in clusters:
+            cx = float(np.median(c["xs"]))
+            cy = float(np.median(c["ys"]))
+            if abs(cx - fx) <= radius and abs(cy - fy) <= radius:
+                c["xs"].append(fx)
+                c["ys"].append(fy)
+                c["areas"].append(area)
+                c["confs"].append(conf)
+                joined = True
+                break
+        if not joined:
+            clusters.append({"xs": [fx], "ys": [fy], "areas": [area], "confs": [conf]})
+
+    # Pass 2: merge clusters whose medians have drifted within `radius` of
+    # each other. The greedy pass can split a real speaker into multiple
+    # clusters when their head movement exceeds `radius` between
+    # successive frames — each new detection might be within `radius` of
+    # the last raw sample but outside `radius` of the running median.
+    # Observed on ENG-5719 calibration clip: the left speaker's 5
+    # detections spanned x=87-156 (69px) and ended up in 2 clusters
+    # whose final medians were 50px apart. A merge-on-median pass
+    # consolidates them without changing the conservative greedy
+    # behaviour on tight-and-static phantom clusters.
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                ci, cj = clusters[i], clusters[j]
+                mxi, myi = float(np.median(ci["xs"])), float(np.median(ci["ys"]))
+                mxj, myj = float(np.median(cj["xs"])), float(np.median(cj["ys"]))
+                if abs(mxi - mxj) <= radius and abs(myi - myj) <= radius:
+                    ci["xs"].extend(cj["xs"])
+                    ci["ys"].extend(cj["ys"])
+                    ci["areas"].extend(cj["areas"])
+                    ci["confs"].extend(cj["confs"])
+                    clusters.pop(j)
+                    merged = True
+                    break
+            if merged:
+                break
+
+    deduped: List[Tuple[int, int, int, float]] = []
+    for c in clusters:
+        rep_x = int(np.median(c["xs"]))
+        rep_y = int(np.median(c["ys"]))
+        rep_area = max(c["areas"])
+        rep_conf = float(np.mean(c["confs"]))
+        deduped.append((rep_x, rep_y, rep_area, rep_conf))
+
+    if len(deduped) < len(face_centers):
+        logger.info(
+            "Deduped face detections: %d raw -> %d unique observations (radius=%dpx)",
+            len(face_centers),
+            len(deduped),
+            radius,
+        )
+    return deduped
 
 
 def filter_face_outliers(
