@@ -1922,6 +1922,52 @@ def build_speaker_timeline_from_motion(
     return merged
 
 
+def score_speaker_labels_by_side(
+    utterances: List[Dict[str, Any]],
+    times: List[float],
+    left_values: List[float],
+    right_values: List[float],
+) -> Dict[str, Dict[str, float]]:
+    """Per-(label, side) lip-motion totals plus airtime — the raw signal that
+    ``map_speaker_labels_to_sides`` consumes.
+
+    Returns ``{label: {"left": L, "right": R, "leftness": L-R, "airtime": secs}}``
+    keyed by every speaker label appearing in ``utterances`` (even when no motion
+    samples fall inside that label's windows — the bug ENG-5755 chases). Exposed
+    as a separate function so the per-shot sidecar can record exactly *why* a
+    given mapping landed where it did, without re-running ffmpeg.
+    """
+    if not utterances or not times or len(left_values) != len(right_values):
+        return {}
+
+    def normalize(values: List[float]) -> List[float]:
+        mean_value = sum(values) / max(len(values), 1)
+        return [value / mean_value if mean_value > 0 else 0.0 for value in values]
+
+    # No pre-smoothing: summing across each speaker's (multi-second) utterance
+    # windows already integrates out per-frame noise; a wide smoothing window
+    # would flatten short clips to their mean and erase the signal.
+    left = normalize(left_values)
+    right = normalize(right_values)
+    if not left or not right:
+        return {}
+
+    stats: Dict[str, Dict[str, float]] = {}
+    for utterance in utterances:
+        label = utterance["speaker"]
+        bucket = stats.setdefault(label, {"left": 0.0, "right": 0.0, "airtime": 0.0})
+        bucket["airtime"] += max(0.0, utterance["end"] - utterance["start"])
+        for idx, sample_time in enumerate(times):
+            if utterance["start"] <= sample_time <= utterance["end"]:
+                bucket["left"] += left[idx]
+                bucket["right"] += right[idx]
+    # Convenience: signed "leftness" (positive = leans left). Kept alongside
+    # the raw totals so consumers don't have to recompute.
+    for bucket in stats.values():
+        bucket["leftness"] = bucket["left"] - bucket["right"]
+    return stats
+
+
 def map_speaker_labels_to_sides(
     utterances: List[Dict[str, Any]],
     times: List[float],
@@ -1931,50 +1977,32 @@ def map_speaker_labels_to_sides(
     """Bind each diarized speaker label to the left/right face zone.
 
     Audio diarization tells us *when* each label speaks; the per-region lip-motion
-    signal (left vs right) tells us *where* that speaker sits. For each label we
-    accumulate the left-minus-right motion over its utterance windows and assign it
-    to the side it leans toward, forcing the two strongest labels onto opposite sides.
+    signal tells us *where* that speaker sits. We sort labels by accumulated
+    "leftness" (left minus right motion across each label's utterance windows) and
+    force the strongest-left and strongest-right labels onto opposite sides — even
+    when one of them has no motion samples in its windows at all.
+
+    ENG-5755: previously a label that never saw a motion sample inside any of its
+    utterance windows never made it into the ``scores`` dict; ``ordered[-1]`` then
+    pointed back at the same label as ``ordered[0]`` and both diarized speakers
+    collapsed to ``{"left"}``. Caller's ``len(set(values)) < 2`` check then
+    returned ``None`` from ``build_two_shot_segments`` even though we had a clean
+    L+R face split. Fix: every label with airtime appears in the sorted list,
+    defaulting to leftness=0 — so the two-label case always yields two distinct
+    sides as long as both speakers have utterances overlapping the shot.
     """
-    if not utterances or not times or len(left_values) != len(right_values):
+    stats = score_speaker_labels_by_side(utterances, times, left_values, right_values)
+    if not stats:
         return {}
 
-    def normalize(values: List[float]) -> List[float]:
-        mean_value = sum(values) / max(len(values), 1)
-        return [value / mean_value if mean_value > 0 else 0.0 for value in values]
-
-    # No pre-smoothing: summing the left-minus-right signal across each speaker's
-    # (multi-second) utterance windows already integrates out per-frame noise, and a
-    # wide smoothing window would flatten short clips to their mean and erase the signal.
-    left = normalize(left_values)
-    right = normalize(right_values)
-    if not left or not right:
-        return {}
-
-    # Per-label accumulated "leftness" (left motion minus right motion) and airtime.
-    scores: Dict[str, float] = {}
-    airtime: Dict[str, float] = {}
-    for utterance in utterances:
-        label = utterance["speaker"]
-        airtime[label] = airtime.get(label, 0.0) + max(
-            0.0, utterance["end"] - utterance["start"]
-        )
-        for idx, sample_time in enumerate(times):
-            if utterance["start"] <= sample_time <= utterance["end"]:
-                scores[label] = scores.get(label, 0.0) + (left[idx] - right[idx])
-
-    if not scores:
-        return {}
-
-    # Assign the most "left-leaning" label to left, the most "right-leaning" to right;
-    # any remaining labels follow the sign of their own score (nearest zone).
-    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    mapping: Dict[str, str] = {}
-    mapping[ordered[0][0]] = "left"
+    # Sort by signed leftness desc — most-left-leaning first, most-right-leaning last.
+    ordered = sorted(stats.items(), key=lambda item: item[1]["leftness"], reverse=True)
+    mapping: Dict[str, str] = {ordered[0][0]: "left"}
     if len(ordered) > 1:
         mapping[ordered[-1][0]] = "right"
-    for label, score in ordered:
+    for label, bucket in ordered:
         if label not in mapping:
-            mapping[label] = "left" if score >= 0 else "right"
+            mapping[label] = "left" if bucket["leftness"] >= 0 else "right"
     return mapping
 
 
@@ -2241,8 +2269,17 @@ def build_two_shot_segments(
     left_x = clamp_even(regions["left"]["center_x"] - crop_w // 2, 0, max(0, width - crop_w))
     right_x = clamp_even(regions["right"]["center_x"] - crop_w // 2, 0, max(0, width - crop_w))
 
-    def fail(reason: str, dominant_side: Optional[str] = None) -> Dict[str, Any]:
-        return {"segments": None, "fallback_reason": reason, "dominant_side": dominant_side}
+    def fail(
+        reason: str,
+        dominant_side: Optional[str] = None,
+        label_stats: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "segments": None,
+            "fallback_reason": reason,
+            "dominant_side": dominant_side,
+            "label_stats": label_stats,
+        }
 
     shot_utterances: List[Dict[str, Any]] = []
     for utterance in utterances:
@@ -2275,17 +2312,30 @@ def build_two_shot_segments(
     times, left_values, right_values = motion
     dominant = "left" if sum(left_values) >= sum(right_values) else "right"
 
+    # ENG-5755: score every label once and surface the raw totals via the result —
+    # the sidecar uses these to make any future label-mapping regression diagnosable
+    # without another instrumentation round.
+    label_stats = score_speaker_labels_by_side(
+        shot_utterances, times, left_values, right_values
+    )
+
     if len({utterance["speaker"] for utterance in shot_utterances}) >= 2:
         label_to_side = map_speaker_labels_to_sides(
             shot_utterances, times, left_values, right_values
         )
         if len(set(label_to_side.values())) < 2:
-            return fail("single_side_speakers", dominant_side=dominant)
+            return fail("single_side_speakers", dominant_side=dominant, label_stats=label_stats)
         timeline = build_speaker_timeline_from_utterances(shot_utterances, label_to_side)
         if len(timeline) < 2:
-            return fail("short_timeline", dominant_side=dominant)
+            return fail("short_timeline", dominant_side=dominant, label_stats=label_stats)
         segments = sides_timeline_to_x_segments(timeline, shot_start, shot_end, left_x, right_x)
-        return {"segments": segments, "fallback_reason": None, "dominant_side": dominant}
+        return {
+            "segments": segments,
+            "fallback_reason": None,
+            "dominant_side": dominant,
+            "label_stats": label_stats,
+            "label_to_side": label_to_side,
+        }
 
     # Single diarized speaker holding a two-shot: frame the talking (higher-motion) person.
     chosen_x = left_x if dominant == "left" else right_x
@@ -2293,6 +2343,7 @@ def build_two_shot_segments(
         "segments": [{"start": shot_start, "end": shot_end, "x": chosen_x}],
         "fallback_reason": None,
         "dominant_side": dominant,
+        "label_stats": label_stats,
     }
 
 
@@ -2379,6 +2430,8 @@ def build_per_shot_cut_plan(
         # speaker out of frame on every stable L+R shot.
         two_shot_fallback_reason: Optional[str] = None
         two_shot_dominant_side: Optional[str] = None
+        two_shot_label_stats: Optional[Dict[str, Dict[str, float]]] = None
+        two_shot_label_to_side: Optional[Dict[str, str]] = None
         if regions is None:
             two_shot_fallback_reason = "no_regions"
         elif motion_passes >= max_motion_passes:
@@ -2391,6 +2444,8 @@ def build_per_shot_cut_plan(
             shot_segments = result["segments"]
             two_shot_fallback_reason = result["fallback_reason"]
             two_shot_dominant_side = result["dominant_side"]
+            two_shot_label_stats = result.get("label_stats")
+            two_shot_label_to_side = result.get("label_to_side")
             if shot_segments:
                 raw_segments.extend(shot_segments)
                 last_framed_x = shot_segments[-1]["x"]
@@ -2426,6 +2481,12 @@ def build_per_shot_cut_plan(
                             }
                             for seg in shot_segments
                         ],
+                        # ENG-5755: raw per-(label, side) motion totals from
+                        # score_speaker_labels_by_side, plus the final mapping.
+                        # Diagnoses any future label-mapping regression from the
+                        # sidecar alone.
+                        "label_stats": two_shot_label_stats,
+                        "label_to_side": two_shot_label_to_side,
                     }
                 )
                 continue
@@ -2466,6 +2527,10 @@ def build_per_shot_cut_plan(
                         "left": {"center_x": int(regions["left"]["center_x"])},
                         "right": {"center_x": int(regions["right"]["center_x"])},
                     },
+                    # ENG-5755: even on the fallback path, surface the per-label
+                    # motion stats so we can confirm the mapping behaviour is right
+                    # and diagnose the rare cases where we still end up here.
+                    "label_stats": two_shot_label_stats,
                 }
             )
             continue
