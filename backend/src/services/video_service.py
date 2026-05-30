@@ -184,6 +184,7 @@ class VideoService:
         highlight_color: Optional[str] = None,
         stroke_color: Optional[str] = None,
         subtitle_position_y: Optional[float] = None,
+        subtitle_top_y: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Create standalone video clips from segments with optional subtitles.
@@ -223,6 +224,7 @@ class VideoService:
                     highlight_color,
                     stroke_color,
                     subtitle_position_y,
+                    subtitle_top_y,
                 )
 
         results = await asyncio.gather(
@@ -250,6 +252,7 @@ class VideoService:
         highlight_color: Optional[str] = None,
         stroke_color: Optional[str] = None,
         subtitle_position_y: Optional[float] = None,
+        subtitle_top_y: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Render a single clip in the thread pool and return clip_info dict, or None on failure."""
         try:
@@ -313,6 +316,7 @@ class VideoService:
                 highlight_color,
                 stroke_color,
                 subtitle_position_y,
+                subtitle_top_y,
             )
 
             if not success:

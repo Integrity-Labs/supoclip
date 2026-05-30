@@ -31,6 +31,7 @@ async def process_video_task(
     stroke_color: str | None = None,
     max_clips: int | None = None,
     subtitle_position_y: float | None = None,
+    subtitle_top_y: float | None = None,
     transcript_url: str | None = None,
 ) -> Dict[str, Any]:
     """
@@ -101,6 +102,7 @@ async def process_video_task(
                 stroke_color=stroke_color,
                 max_clips=max_clips,
                 subtitle_position_y=subtitle_position_y,
+                subtitle_top_y=subtitle_top_y,
                 transcript_url=transcript_url,
             )
 
