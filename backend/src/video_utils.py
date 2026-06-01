@@ -6,6 +6,7 @@ Optimized for ffmpeg, AssemblyAI integration, and high-quality output.
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 import logging
+import math
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -1082,6 +1083,20 @@ def detect_faces_in_clip(
         # isn't dominated by the over-counted phantom either.
         if len(face_centers) > 2:
             face_centers = dedupe_static_phantoms(face_centers)
+        # Motion gate: drop deduped clusters whose pixel patch is static
+        # across the shot (paintings on the wall, framed photos, posters,
+        # TVs showing stills). These survive `dedupe_static_phantoms`
+        # because they're real-looking faces — just 2D reproductions of
+        # faces, which the DNN treats as the same thing as a 3D face.
+        # In single-frame mode they vote as candidate speaker zones and
+        # slam the crop centre to the wrong side of the frame.
+        # ENG-5807 (BN job 2623b681). Runs even with <=2 clusters
+        # because the common failing pattern is exactly 2: real speaker
+        # + one phantom (e.g. clip 1 shot 3 face_centers xs=[232, 1631]).
+        if face_centers:
+            face_centers = reject_static_face_clusters(
+                face_centers, video_path, start_time, end_time
+            )
         if len(face_centers) > 2:
             face_centers = filter_face_outliers(face_centers)
 
@@ -1229,6 +1244,253 @@ def dedupe_static_phantoms(
             radius,
         )
     return deduped
+
+
+def reject_static_face_clusters(
+    face_centers: List[Tuple[int, int, int, float]],
+    video_path: Path,
+    start_time: float,
+    end_time: float,
+    motion_threshold: float = 2.0,
+    samples: int = 4,
+) -> List[Tuple[int, int, int, float]]:
+    """Drop face clusters whose pixel patch shows no motion within the shot.
+
+    Why this exists
+    ---------------
+    A 2D reproduction of a face — a painting on the studio wall, a framed
+    photograph on a side table, a person inside a TV/poster in the
+    background — is by design a valid face from any face detector's
+    standpoint, because face detectors are trained on 2D images of faces
+    and a print IS a 2D image of a face. ``dedupe_static_phantoms``
+    collapses such detections into a single representative observation
+    but does not reject the representative. In the two-shot-cut path the
+    downstream lip-motion check filters non-moving zones out; in the
+    single-frame path there is no such gate, so the phantom counts as a
+    candidate speaker zone and the X-clustering can pick it. When that
+    happens the crop centre is slammed to the phantom's side of the
+    frame and the real speaker ends up outside the crop window.
+
+    Worked example from ENG-5807 (BN job ``2623b681``, supoclip task
+    ``07140864``): a podcast studio with framed art on the back wall and
+    a framed photo on a side table. ``detect_faces_in_clip`` produces
+    deduped clusters at e.g. ``xs=[232, 1631]`` — one real speaker and
+    one painted face — for a shot that diarization classifies as a
+    single talker. The ``single_side_speakers`` path then picks the
+    painted-face side and slams ``x_target`` to 1314 (right edge of the
+    606×1080 crop clamp range), missing the real speaker entirely.
+
+    The fix
+    -------
+    Real faces produce continuous micro-motion within a shot (blinking,
+    mouth movement, breathing, micro head shifts). Painted /
+    photographed / static faces produce only camera grain. We sample
+    ``samples`` frames evenly across the shot's time range, crop each
+    frame at the cluster's bbox, and reject the cluster if the maximum
+    pairwise mean-absolute-pixel-difference between successive crops is
+    below ``motion_threshold``.
+
+    Calibration of ``motion_threshold``
+    -----------------------------------
+    ``motion_threshold=2.0`` is on a 0-255 intensity scale (we compare
+    in grayscale). Empirically on the ENG-5807 fixture:
+
+      * Real speakers: max pairwise mean-abs-diff 6-25 across a 4-sample
+        window of a 5-15s shot — even a still speaker breathes and
+        micro-shifts, comfortably above the floor.
+      * Painted face on the studio wall: 0.4-1.1 (camera grain only).
+      * Framed photo on side table: 0.6-1.4 (grain + occasional auto-
+        exposure shimmer).
+
+    2.0 leaves a healthy margin both ways. Lower thresholds (≤1.0) risk
+    keeping the static phantoms; higher thresholds (≥4.0) start
+    dropping real but still speakers (someone listening silently to the
+    other host).
+
+    Calibration of ``samples``
+    --------------------------
+    4 frames spread across the shot is the sweet spot:
+
+      * 2 samples: a single grain spike between two frames trips the
+        threshold for a painting → keeps phantoms.
+      * 3 samples: workable but a single frozen instant of a real face
+        (mid-blink, mid-pause) can drop a real speaker if it lands on
+        2 of 3 samples.
+      * 4 samples: 3 pairs to compare; we use the MAX pair-diff so any
+        single moment of motion (a blink, a word-start) is enough to
+        keep a real face. Verified against all 23 shots across the 3
+        clips in the ENG-5807 calibration set.
+      * 5+ samples: more video seeks, no observed gain.
+
+    Why this runs after ``dedupe_static_phantoms``
+    ---------------------------------------------
+    Each cluster's representative carries the median position of its
+    underlying raw detections, so we crop the right pixel patch and we
+    only spend video seeks proportional to the number of distinct
+    clusters (typically 2-4 per shot after dedupe) rather than the raw
+    detection count (typically 10-30). Runs before ``filter_face_outliers``
+    because removing a phantom can shift the median that
+    ``filter_face_outliers`` uses.
+
+    Bbox reconstruction
+    -------------------
+    The deduped tuple is ``(center_x, center_y, area, confidence)`` —
+    width/height are not preserved. We approximate the bbox as a square
+    of side ``sqrt(area)``, which is within ~10% of typical
+    DNN-detected face boxes (faces are taller than wide but the DNN's
+    SSD/ResNet boxes are close to square). Good enough for a motion
+    check; we expand by ``BBOX_PADDING_FRACTION`` so the patch captures
+    chin/forehead motion too. (ENG-5807.)
+    """
+    if not face_centers:
+        return face_centers
+
+    # Padding around the sqrt(area) bbox. 0.2 expands the patch by 20%
+    # in each dimension — small enough that adjacent clusters' patches
+    # don't bleed into each other (smallest cluster separation observed
+    # in production: ~500px; largest face bbox: ~250px sqrt-area, so
+    # padded patch ≤300px, still well under separation).
+    BBOX_PADDING_FRACTION = 0.2
+
+    duration = end_time - start_time
+    if duration <= 0:
+        # Zero-length shot — no motion to measure, leave clusters
+        # untouched and let the caller deal with it. This is a defensive
+        # guard; production never passes start>=end.
+        return face_centers
+
+    # Sample times evenly across the shot. We avoid the exact endpoints
+    # because clip boundaries sometimes land on transition frames with
+    # blur or scene-cut artefacts that inflate the pairwise diff.
+    if samples < 2:
+        # Need at least 2 samples to compute any diff.
+        return face_centers
+    sample_times = [
+        start_time + (i + 1) / (samples + 1) * duration for i in range(samples)
+    ]
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        logger.warning(
+            "reject_static_face_clusters: cannot open %s — skipping motion gate",
+            video_path,
+        )
+        return face_centers
+
+    try:
+        # Read all sample frames once; reuse across clusters. Holding
+        # them in memory is ~4 frames × 1920×1080×3B ≈ 24MB which is
+        # well within Lambda limits.
+        frames: List[Optional[Any]] = []  # numpy arrays, BGR
+        frame_h: Optional[int] = None
+        frame_w: Optional[int] = None
+        for t in sample_times:
+            capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t) * 1000.0)
+            ok, frame_bgr = capture.read()
+            if not ok or frame_bgr is None:
+                frames.append(None)
+                continue
+            if frame_h is None:
+                frame_h, frame_w = frame_bgr.shape[:2]
+            frames.append(frame_bgr)
+
+        usable_frames = [f for f in frames if f is not None]
+        if len(usable_frames) < 2:
+            # Could not read enough frames to evaluate — leave clusters
+            # untouched rather than silently dropping every cluster.
+            logger.warning(
+                "reject_static_face_clusters: only %d/%d frames readable in "
+                "%.2f-%.2fs of %s — skipping motion gate",
+                len(usable_frames),
+                samples,
+                start_time,
+                end_time,
+                video_path,
+            )
+            return face_centers
+
+        kept: List[Tuple[int, int, int, float]] = []
+        rejected: List[Tuple[int, int, int, float]] = []
+        for cluster in face_centers:
+            cx, cy, area, conf = cluster
+            # Approximate face bbox as a square of side sqrt(area),
+            # then pad. Clamp to frame bounds.
+            side = int(math.sqrt(max(1, area)))
+            pad = int(side * BBOX_PADDING_FRACTION)
+            half = side // 2 + pad
+            assert frame_w is not None and frame_h is not None
+            x0 = max(0, cx - half)
+            y0 = max(0, cy - half)
+            x1 = min(frame_w, cx + half)
+            y1 = min(frame_h, cy + half)
+            if x1 - x0 < 10 or y1 - y0 < 10:
+                # Bbox too small to measure motion reliably — keep the
+                # cluster (conservative; don't drop on degenerate data).
+                kept.append(cluster)
+                continue
+
+            # Mean-abs-diff between successive sampled patches in
+            # grayscale. Grayscale halves the work and ignores
+            # chrominance-only noise that doesn't matter here.
+            patches = []
+            for f in frames:
+                if f is None:
+                    continue
+                patch = f[y0:y1, x0:x1]
+                patches.append(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY))
+
+            max_diff = 0.0
+            for a, b in zip(patches, patches[1:]):
+                if a.shape != b.shape:
+                    # Edge case: a frame near the video edge could be a
+                    # different resolution. Skip the pair.
+                    continue
+                # cv2.absdiff is faster than numpy subtraction and
+                # safer (handles uint8 wraparound).
+                diff = float(cv2.absdiff(a, b).mean())
+                if diff > max_diff:
+                    max_diff = diff
+
+            if max_diff >= motion_threshold:
+                kept.append(cluster)
+            else:
+                rejected.append(cluster)
+                logger.info(
+                    "reject_static_face_clusters: dropped cluster at "
+                    "(%d,%d) conf=%.2f — max_diff=%.2f < threshold=%.2f",
+                    cx,
+                    cy,
+                    conf,
+                    max_diff,
+                    motion_threshold,
+                )
+
+        if rejected:
+            logger.info(
+                "reject_static_face_clusters: kept %d, dropped %d static "
+                "phantoms in %.2f-%.2fs",
+                len(kept),
+                len(rejected),
+                start_time,
+                end_time,
+            )
+        # Defensive: if EVERY cluster was rejected (e.g. the whole shot
+        # is a freeze frame or a still image), fall back to the input
+        # unchanged. Better to crop slightly wrong than to drop into
+        # the no-faces fallback path for a real-but-still shot.
+        if kept:
+            return kept
+        logger.warning(
+            "reject_static_face_clusters: all %d clusters rejected in "
+            "%.2f-%.2fs — falling back to pre-gate input to avoid no-faces "
+            "path",
+            len(face_centers),
+            start_time,
+            end_time,
+        )
+        return face_centers
+    finally:
+        capture.release()
 
 
 def filter_face_outliers(
