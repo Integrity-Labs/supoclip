@@ -21,11 +21,10 @@ case.
 """
 
 from pathlib import Path
-from typing import List
+from typing import Any, ContextManager, List, Optional, Tuple
 from unittest.mock import patch
 
 import numpy as np
-import pytest
 
 from src.video_utils import reject_static_face_clusters
 
@@ -71,23 +70,23 @@ class _FakeCapture:
     def isOpened(self) -> bool:
         return True
 
-    def set(self, prop, value):  # noqa: D401, ANN001
+    def set(self, prop: int, value: float) -> bool:
         # We don't actually need to use the requested timestamp; each set/read
         # pair just yields the next pre-built frame in order.
         return True
 
-    def read(self):
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         if self._idx >= len(self._frames):
             return False, None
         frame = self._frames[self._idx]
         self._idx += 1
         return True, frame
 
-    def release(self):  # noqa: D401
+    def release(self) -> None:
         return None
 
 
-def _patch_capture(frames: List[np.ndarray]):
+def _patch_capture(frames: List[np.ndarray]) -> ContextManager[Any]:
     """Context manager — patches cv2.VideoCapture in video_utils to return
     a _FakeCapture pre-loaded with `frames`."""
     return patch("src.video_utils.cv2.VideoCapture", return_value=_FakeCapture(frames))
@@ -211,20 +210,28 @@ class TestRejectStaticFaceClustersKnobs:
     def test_lower_threshold_keeps_more(self):
         """A very low threshold (0.5) keeps clusters with small but real
         differences that the production threshold (2.0) would drop."""
-        # Subtle motion: values cycle 100 → 101 → 102 → 103 → max diff ≈ 1.
-        frames = [
-            _frame_with_patches(moving_regions=[(50, 50, 70, 70, v)])
-            for v in (100, 101, 102, 103)
-        ]
+        # Subtle motion under test: values cycle 100→101→102→103 → max diff ≈ 1.
+        # Plus a clearly-moving companion at (130, 130) so the all-rejected
+        # fallback doesn't fire and mask the threshold behaviour.
+        def _build_frames() -> List[np.ndarray]:
+            return [
+                _frame_with_patches(
+                    moving_regions=[
+                        (50, 50, 70, 70, subtle),
+                        (120, 120, 140, 140, companion),
+                    ],
+                )
+                for subtle, companion in zip(
+                    (100, 101, 102, 103), (0, 80, 160, 240), strict=True,
+                )
+            ]
+
         clusters_with_companion = [
             (60, 60, 400, 0.9),     # subtle-motion cluster under test
             (130, 130, 400, 0.9),   # companion so fallback doesn't fire
         ]
-        # Add a clearly-moving companion patch to the frames.
-        for f, v in zip(frames, (0, 80, 160, 240)):
-            f[120:140, 120:140] = v
 
-        with _patch_capture(frames):
+        with _patch_capture(_build_frames()):
             result_strict = reject_static_face_clusters(
                 clusters_with_companion, Path("/dummy.mp4"), 0.0, 4.0,
                 motion_threshold=2.0, samples=4,
@@ -233,15 +240,8 @@ class TestRejectStaticFaceClustersKnobs:
             "subtle-motion cluster should be dropped at threshold=2.0"
         )
 
-        # Same frames, threshold=0.5 → the subtle-motion cluster survives.
-        # Rebuild frames because the prior patch loop mutated them.
-        frames2 = [
-            _frame_with_patches(moving_regions=[(50, 50, 70, 70, v)])
-            for v in (100, 101, 102, 103)
-        ]
-        for f, v in zip(frames2, (0, 80, 160, 240)):
-            f[120:140, 120:140] = v
-        with _patch_capture(frames2):
+        # Same frame shape, threshold=0.5 → the subtle-motion cluster survives.
+        with _patch_capture(_build_frames()):
             result_loose = reject_static_face_clusters(
                 clusters_with_companion, Path("/dummy.mp4"), 0.0, 4.0,
                 motion_threshold=0.5, samples=4,
@@ -317,8 +317,13 @@ class TestRejectStaticFaceClustersDefensive:
         input rather than handing downstream code an empty list. Empty
         face_centers triggers the no-faces fallback path which can
         produce a worse crop than 'wrong but plausible'."""
-        # All-static frame; cluster will look static.
-        frames = [_frame_with_patches(static_regions=[(50, 50, 70, 70, 200)])] * 4
+        # All-static frame; cluster will look static. Build each frame
+        # fresh (rather than `[...] * 4`) so tests stay safe if someone
+        # later mutates _frame_with_patches output in this test.
+        frames = [
+            _frame_with_patches(static_regions=[(50, 50, 70, 70, 200)])
+            for _ in range(4)
+        ]
         clusters = [(60, 60, 400, 0.9)]
         with _patch_capture(frames):
             result = reject_static_face_clusters(

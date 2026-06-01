@@ -1489,6 +1489,21 @@ def reject_static_face_clusters(
             end_time,
         )
         return face_centers
+    except Exception as exc:
+        # Defensive: an unexpected error inside the motion gate must NOT
+        # propagate up into `detect_faces_in_clip`'s outer try/except,
+        # which would swallow the entire face-detection result as [].
+        # Letting through the un-gated phantoms is a smaller risk than
+        # handing downstream code an empty list and triggering the
+        # no-faces fallback path. Log loudly so failures aren't silent.
+        # (CodeRabbit on PR #39.)
+        logger.warning(
+            "reject_static_face_clusters: unexpected error %r — falling "
+            "back to pre-gate input (%d clusters)",
+            exc,
+            len(face_centers),
+        )
+        return face_centers
     finally:
         capture.release()
 
